@@ -221,14 +221,14 @@
 <body>
 
 <header>
-  <h1>📋 Solicitud de Justificación de Inasistencia</h1>
+  <h1>Solicitud de Justificación de Inasistencia</h1>
   <p>Sistema Inteligente de Gestión — Procesamiento automático con IA</p>
   <span class="badge">⚡ Respuesta en minutos</span>
 </header>
 
 <div class="card">
   <div class="info-banner">
-    ℹ️ Tu solicitud será analizada automáticamente. Recibirás el resultado vía <strong>Telegram</strong> o correo electrónico.
+    Tu solicitud será analizada automáticamente. Recibirás el resultado vía <strong>Telegram</strong> o correo electrónico.
   </div>
 
   <form id="justification-form" enctype="multipart/form-data">
@@ -308,94 +308,43 @@
   </form>
 
   <div id="success-msg">
-    <h3>✅ Solicitud Enviada Correctamente</h3>
+    <h3>Solicitud Enviada Correctamente</h3>
     <p>Tu solicitud está siendo procesada por el sistema de IA.</p>
     <div class="code" id="request-code">JUS-2024-00001</div>
     <p>Guarda este código para consultar el estado de tu solicitud.</p>
     <p style="margin-top: 12px;">Recibirás una notificación en <strong>Telegram</strong> cuando el análisis esté listo.</p>
   </div>
 </div>
-
 <script>
-  // Drag-and-drop
-  const area = document.getElementById('upload-area');
-  const fileInput = document.getElementById('file');
-  const preview = document.getElementById('file-preview');
 
-  area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('dragover'); });
-  area.addEventListener('dragleave', () => area.classList.remove('dragover'));
-  area.addEventListener('drop', e => {
+const WEBHOOK_URL = 'https://parrot-afternoon-unloader.ngrok-free.dev/webhook/justificacion';
+
+document.querySelector('form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    area.classList.remove('dragover');
-    if (e.dataTransfer.files.length) {
-      fileInput.files = e.dataTransfer.files;
-      showFilePreview(e.dataTransfer.files[0]);
-    }
-  });
-
-  fileInput.addEventListener('change', () => {
-    if (fileInput.files[0]) showFilePreview(fileInput.files[0]);
-  });
-
-  function showFilePreview(file) {
-    if (file.size > 5 * 1024 * 1024) {
-      preview.textContent = '⚠️ El archivo supera los 5 MB permitidos.';
-      preview.style.color = '#dc2626';
-      return;
-    }
-    preview.textContent = `✅ ${file.name} (${(file.size / 1024).toFixed(0)} KB)`;
-    preview.style.color = '#16a34a';
-  }
-
-  // Set max date to today
-  document.getElementById('absence_date').max = new Date().toISOString().split('T')[0];
-
-  // Form submit
-  document.getElementById('justification-form').addEventListener('submit', async function(e) {
-    e.preventDefault();
-
-    const btn     = document.getElementById('submit-btn');
-    const spinner = document.getElementById('spinner');
-    const btnText = document.getElementById('btn-text');
-    const errMsg  = document.getElementById('error-msg');
-
-    btn.disabled  = true;
-    spinner.style.display = 'block';
-    btnText.textContent   = 'Enviando...';
-    errMsg.style.display  = 'none';
-
-   const formData = new FormData(this);
-
-const response = await fetch(WEBHOOK_URL, {
-  method: 'POST',
-  body: formData // Pasa el formData directo, SIN añadir "headers: { 'Content-Type': ... }"
-});
+    const btn = e.target.querySelector('button');
+    btn.disabled = true;
+    btn.textContent = 'Enviando...';
 
     try {
-      // El webhook URL viene configurado via variable en el HTML servido
-      // Usa la URL que viste en el panel de Ngrok
-// Cambiar /webhook/ por /webhook-test/ para que n8n lo capture en modo de diseño
-const WEBHOOK_URL = 'https://16a4-190-111-40-155.ngrok-free.dev/webhook-test/justificacion';      const response = await fetch(WEBHOOK_URL, {
-        method: 'POST',
-        body: formData
-      });
+        const formData = new FormData(e.target);
+        const response = await fetch(WEBHOOK_URL, {
+            method: 'POST',
+            body: formData // FormData incluye automáticamente el archivo binario
+        });
 
-      if (!response.ok) throw new Error(`Error del servidor: ${response.status}`);
-
-      const result = await response.json();
-
-      document.getElementById('request-code').textContent = result.request_code || 'JUS-PENDING';
-      document.getElementById('justification-form').style.display = 'none';
-      document.getElementById('success-msg').style.display = 'block';
-
+        if (!response.ok) throw new Error('Error al enviar solicitud');
+        
+        // Ocultar form, mostrar éxito
+        document.getElementById('justification-form').style.display = 'none';
+        document.getElementById('success-msg').style.display = 'block';
     } catch (err) {
-      errMsg.textContent    = '❌ Ocurrió un error al enviar la solicitud. Por favor intenta de nuevo.';
-      errMsg.style.display  = 'block';
-      btn.disabled          = false;
-      spinner.style.display = 'none';
-      btnText.textContent   = 'Enviar Solicitud';
+        console.error(err);
+        alert('Error: ' + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Enviar Solicitud';
     }
-  });
+});
 </script>
 
 </body>
