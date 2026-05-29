@@ -1,0 +1,899 @@
+{
+  "name": "proyecto",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "justificacion",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "b9801a49-87a1-4692-8787-2f6081989726",
+      "name": "Webhook Recepción",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        -1424,
+        -80
+      ],
+      "webhookId": "e31d28c3-c4b6-4028-a646-b027cf01fefd",
+      "notes": "Punto de entrada principal. Recibe datos del formulario web con archivos adjuntos."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Validación y sanitización de datos entrantes ──\nconst body = $input.first().json.body;\nconst files = $input.first().binary;\n\n// Validar campos requeridos\nconst required = ['student_id', 'full_name', 'email', 'absence_date', 'absence_reason'];\nconst missing = required.filter(f => !body[f]);\n\nif (missing.length > 0) {\n  throw new Error(`Campos requeridos faltantes: ${missing.join(', ')}`);\n}\n\n// Sanitizar inputs\nconst sanitize = str => str ? str.toString().trim().replace(/<[^>]*>/g, '').substring(0, 500) : '';\n\n// Generar request code temporal (será reemplazado por PostgreSQL)\nconst timestamp = Date.now();\nconst tempCode = `JUS-${new Date().getFullYear()}-${String(timestamp).slice(-5)}`;\n\n// Detectar tipo de archivo\nconst fileKey = Object.keys(files || {})[0];\nconst fileData = files?.[fileKey];\nconst fileType = fileData?.mimeType || 'unknown';\n\n// Validar tipo de archivo permitido\nconst allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf'];\nif (fileData && !allowedTypes.includes(fileType)) {\n  throw new Error(`Tipo de archivo no permitido: ${fileType}. Solo PDF, JPG, PNG.`);\n}\n\n// Validar tamaño (5MB máx)\nif (fileData && fileData.fileSize > 5 * 1024 * 1024) {\n  throw new Error('El archivo supera el límite de 5 MB.');\n}\n\nreturn [{\n  json: {\n    temp_request_code: tempCode,\n    student_id:        sanitize(body.student_id),\n    full_name:         sanitize(body.full_name),\n    email:             sanitize(body.email),\n    program:           sanitize(body.program || ''),\n    telegram_id:       sanitize(body.telegram_id || ''),\n    absence_date:      body.absence_date,\n    absence_reason:    body.absence_reason,\n    description:       sanitize(body.description || ''),\n    has_file:          !!fileData,\n    file_type:         fileType,\n    file_key:          fileKey || null,\n    received_at:       new Date().toISOString()\n  },\n  binary: files || {}\n}];"
+      },
+      "id": "89dcaac0-437e-405f-9dd0-46a4f34cb5b4",
+      "name": "Validar y Sanitizar Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1248,
+        128
+      ],
+      "notes": "Valida campos requeridos, sanitiza inputs y verifica tipo/tamaño de archivo."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO students (student_id, full_name, email, program, telegram_chat_id)\nVALUES (\n  {{ $json.student_id }}, \n  '{{ $json.full_name }}', \n  '{{ $json.email }}', \n  '{{ $json.program }}', \n  NULLIF('{{ $json.telegram_id }}', '')::BIGINT\n)\nON CONFLICT (student_id) DO UPDATE SET\n  full_name = EXCLUDED.full_name,\n  email = EXCLUDED.email,\n  program = COALESCE(EXCLUDED.program, students.program),\n  telegram_chat_id = COALESCE(NULLIF(EXCLUDED.telegram_chat_id::TEXT, '')::BIGINT, students.telegram_chat_id),\n  updated_at = NOW()\nRETURNING id, student_id, telegram_chat_id;",
+        "options": {}
+      },
+      "id": "3f13ea81-e1a8-4ae9-8c8f-239cf6f5753a",
+      "name": "Upsert Estudiante PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -1088,
+        128
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "oC5JWDtfvxbOL5Zt",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Crea o actualiza el registro del estudiante en la base de datos."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO justification_requests (\n    request_code, \n    student_id, \n    absence_date, \n    absence_reason, \n    description, \n    status, \n    file_type, \n    submitted_at\n)\nVALUES (\n    generate_request_code(), \n    '{{ $json.id }}',       \n    '{{ $('Webhook Recepción').item.json.body.absence_date }}',\n    '{{ $('Webhook Recepción').item.json.body.absence_reason }}', \n    '{{ $('Webhook Recepción').item.json.body.description }}',    \n    'processing',                                                \n    '{{ $('Validar y Sanitizar Input').item.json.file_type }}',                                                       \n    NOW()                                                        \n)\nRETURNING id, request_code;",
+        "options": {}
+      },
+      "id": "8e457d83-8493-40f2-8702-a377df92704c",
+      "name": "Crear Solicitud en DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        128
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "oC5JWDtfvxbOL5Zt",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Inserta el registro de la solicitud con código único auto-generado."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Marcar solicitud como duplicada y enviar alerta ──\nreturn [{\n  json: {\n    ...$json,\n    status: 'rejected',\n    classification: 'invalida',\n    confidence_score: 0,\n    decision_reason: 'Documento duplicado: ya fue presentado en una solicitud anterior.',\n    fraud_flags: JSON.stringify([{ type: 'duplicate_document', severity: 'high' }])\n  }\n}];"
+      },
+      "id": "f12d6c2b-2243-4f65-b598-d886fb9c1b5c",
+      "name": " Marcar como Duplicado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Clasifica la solicitud como inválida por duplicación."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.ocr.space/parse/image",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "K86111760988957"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "file"
+            },
+            {
+              "name": "language",
+              "value": "spa"
+            },
+            {
+              "name": "OCREngine",
+              "value": "2"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c597c219-a26d-48b1-adb0-61628719f2d6",
+      "name": "OCR.Space — Extraer Texto",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        224,
+        128
+      ],
+      "retryOnFail": false,
+      "notes": "Extrae texto del documento usando OCR.Space API Engine 2."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Manejar solicitud sin archivo adjunto ──\nconst data = $json;\nreturn [{ json: {\n  ...data,\n  ocr_raw_text: '',\n  ocr_cleaned_text: data.description || 'No se adjuntó documento de soporte.',\n  ocr_quality: 'none'\n}}];"
+      },
+      "id": "93da2b5c-38a1-4b2f-a955-1704754e15af",
+      "name": "Texto Sin Archivo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        320
+      ],
+      "notes": "Usa la descripción del formulario si no hay archivo."
+    },
+    {
+      "parameters": {
+        "model": "chatgpt-image-latest",
+        "prompt": "=Actúa como un asistente administrativo experto en gestión escolar. Analiza la justificación de inasistencia basándote en estos datos:\n\n### Datos del Estudiante:\n- Nombre: {{ $json.full_name }}\n- Fecha de ausencia: {{ $json.absence_date }}\n- Motivo reportado: {{ $json.absence_reason }}\n\n### Documento Adjunto (OCR):\n\"\"\"\n{{ $json.ocr_cleaned_text }}\n\"\"\"\n\n### Instrucciones:\n1. Compara el motivo reportado con el documento adjunto.\n2. Clasifica en: \"Válida\", \"Inválida\" o \"Pendiente de Revisión\".\n3. Extrae la fecha del documento si existe.\n4. Responde ÚNICAMENTE en formato JSON:\n{\n  \"clasificacion\": \"resultado\",\n  \"confianza\": \"alta/media/baja\",\n  \"fecha_documento\": \"YYYY-MM-DD\",\n  \"comentario\": \"explicacion breve\"\n}",
+        "options": {
+          "maxTokens": 1500,
+          "temperature": 0.1
+        },
+        "requestOptions": {}
+      },
+      "id": "921b2caa-7bc2-44c1-a099-300733157321",
+      "name": "OpenAI — Clasificar Documento",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        992,
+        640
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "openAiApi": {
+          "id": "DVcLNbdyJbV3hlmK",
+          "name": "OpenAI account"
+        }
+      },
+      "notes": "Análisis IA principal: clasificación, confianza y detección de fraude."
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Parsear la respuesta de la IA de forma segura\nlet aiResult;\nconst rawInput = $json.message?.content || $json.text || \"\";\n\n// Limpiamos el texto por si Gemini devuelve markdown como ```json ... ```\nconst cleanJson = rawInput.replace(/```json\\n?|\\n?```/g, \"\").trim();\n\ntry {\n  aiResult = JSON.parse(cleanJson);\n} catch (e) {\n  // Si falla el parseo, devolvemos un valor seguro por defecto\n  aiResult = {\n    clasificacion: 'pendiente',\n    confianza: 'baja',\n    decision_reason: 'Error al interpretar la respuesta de la IA.',\n    fecha_detectada: null\n  };\n}\n\n// 2. Definir umbrales (evitamos process.env)\nconst HIGH = 80;\nconst MID = 40;\n\n// 3. Normalizar puntaje de confianza (si es string, convertir a número)\nconst score = parseInt(aiResult.confianza === 'alta' ? 90 : (aiResult.confianza === 'media' ? 50 : 10)) || 0;\n\n// 4. Lógica de decisión\nlet finalStatus, finalClassification;\n\nif (score >= HIGH) {\n  finalStatus = 'approved';\n  finalClassification = 'valida';\n} else if (score <= MID) {\n  finalStatus = 'rejected';\n  finalClassification = 'invalida';\n} else {\n  finalStatus = 'manual_review';\n  finalClassification = 'dudosa';\n}\n\n// 5. Retornar los datos enriquecidos\nreturn [{ \n  json: {\n    ...$input.all()[0].json, // Mantenemos los datos anteriores\n    final_status: finalStatus,\n    final_classification: finalClassification,\n    confidence_score: score,\n    ai_analysis: aiResult,\n    decision_reason: aiResult.decision_reason || \"Sin motivo\",\n    document_type: aiResult.document_type || \"desconocido\"\n  }\n}];"
+      },
+      "id": "c9aaa0af-0592-46c8-ac4f-ef7dc18e3530",
+      "name": "Motor de Decisión",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1248,
+        128
+      ],
+      "notes": "Aplica lógica híbrida: score >= 80% aprobación automática, 40-79% revisión manual, < 40% rechazo."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE justification_requests SET\n  status = {{ $json.final_status }},\n  classification = {{ $json.final_classification }},\n  confidence_score = {{ $json.confidence_score }},\n  ai_analysis = {{ JSON.stringify($json.ai_analysis) }},\n  fraud_flags = {{ JSON.stringify($json.fraud_flags) }},\n  decision_reason = {{ $('Motor de Decisión').item.json.decision_reason }},\n  ocr_raw_text = {{ $json.ocr_raw_text }},\n  ocr_cleaned_text = {{ $json.ocr_cleaned_text }},\n  file_hash = {{ $('Calcular Hash Archivo').item.json.file_hash }},\n  processed_at = NOW(),\n  updated_at = NOW()\nWHERE id = {{ $('Upsert Estudiante PostgreSQL').item.json.id }}\nRETURNING id, request_code, status;",
+        "options": {}
+      },
+      "id": "dcbe6d5e-869a-4e3f-a523-edbab3b54d36",
+      "name": "Guardar Resultado en DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        128
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "oC5JWDtfvxbOL5Zt",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_SHEETS_ID }}"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Solicitudes"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Código": "={{ $json.request_code }}",
+            "Fecha Solicitud": "={{ $json.received_at }}",
+            "ID Estudiante": "={{ $json.student_id }}",
+            "Nombre": "={{ $json.full_name }}",
+            "Email": "={{ $json.email }}",
+            "Motivo": "={{ $json.absence_reason }}",
+            "Fecha Inasistencia": "={{ $json.absence_date }}",
+            "Estado": "={{ $json.final_status }}",
+            "Clasificación": "={{ $json.final_classification }}",
+            "Score Confianza": "={{ $json.confidence_score }}",
+            "Tipo Documento": "={{ $json.document_type }}",
+            "Razón Decisión": "={{ $json.decision_reason }}",
+            "Procesado": "={{ new Date().toISOString() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "a6f3aa50-193c-43d6-8c35-9834695bc2a8",
+      "name": "📊 Google Sheets — Registrar",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        1696,
+        32
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "yOjlrZ9aYfhPDgQi",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Registra la solicitud procesada en Google Sheets para seguimiento."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Construir mensaje Telegram según resultado ──\nconst statusEmoji = {\n  'approved':      '✅',\n  'rejected':      '❌',\n  'manual_review': '🔍',\n  'error':         ''\n};\n\nconst statusLabel = {\n  'approved':      'APROBADA',\n  'rejected':      'RECHAZADA',\n  'manual_review': 'EN REVISIÓN MANUAL',\n  'error':         'ERROR DE PROCESAMIENTO'\n};\n\nconst emoji = statusEmoji[$json.final_status] || '📋';\nconst label = statusLabel[$json.final_status] || $json.final_status.toUpperCase();\nconst score = Math.round($json.confidence_score || 0);\n\nconst message = `${emoji} *Solicitud ${label}*\n\n` +\n  `📋 Código: \\`${$json.request_code}\\`\n` +\n  `👤 Estudiante: ${$json.full_name}\n` +\n  `📅 Fecha inasistencia: ${$json.absence_date}\n` +\n  `📌 Motivo: ${$json.absence_reason}\n` +\n  `🎯 Score de confianza: ${score}%\n\n` +\n  `*Análisis:*\n${$json.decision_reason || 'Sin detalles disponibles.'}\n\n` +\n  ` _Procesado automáticamente por Sistema IA_`;\n\n// Chat ID del estudiante (si tiene Telegram)\nconst chatId = $json.telegram_id || null;\n\nreturn [{ json: {\n  ...$json,\n  telegram_message: message,\n  telegram_chat_id: chatId\n}}];"
+      },
+      "id": "e9f9a86b-8c97-417c-ab08-ba5ca5a10b9f",
+      "name": "Construir Mensaje Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1696,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond_has_telegram",
+              "leftValue": "={{ $json.telegram_chat_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "3f971330-7021-4c95-bc5b-069584236b6d",
+      "name": " ¿Tiene Telegram?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.telegram_chat_id }}",
+        "text": "={{ $json.telegram_message }}",
+        "additionalFields": {
+          "disable_notification": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "f6773924-1011-4daf-8a4f-9898fc462237",
+      "name": "📱 Enviar Telegram — Estudiante",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        2128,
+        144
+      ],
+      "webhookId": "97a8feac-13a7-44a6-9555-62c3b0810a9c",
+      "credentials": {
+        "telegramApi": {
+          "id": "kWHKrQYuoXcHM8Nk",
+          "name": "Telegram account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ADMIN_CHAT_ID }}",
+        "text": "🔔 *Nueva solicitud procesada*\n\nCódigo: `{{ $json.request_code }}`\nEstudiante: {{ $json.full_name }}\nEstado: {{ $json.final_status }}\nScore: {{ $json.confidence_score }}%",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "d915a499-433c-4f2a-b89d-352137db66e2",
+      "name": "🔔 Notificar Admin",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        2128,
+        320
+      ],
+      "webhookId": "b94d7d6b-22f5-4b82-ae97-a1710e4bdc43",
+      "continueOnFail": true,
+      "notes": "Notifica al administrador en casos de revisión manual o errores."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, request_code: $('📝 Crear Solicitud en DB').first().json[0].request_code, status: $json.final_status, message: 'Solicitud recibida y procesada correctamente.' }) }}",
+        "options": {}
+      },
+      "id": "95736d09-68eb-4f67-8ae5-dfb0a1642d3d",
+      "name": "📨 Responder al Formulario",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2352,
+        128
+      ],
+      "notes": "Devuelve respuesta JSON al formulario web con el código de solicitud."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO system_logs (level, module, request_id, message, metadata, execution_id)\nVALUES ('error', 'workflow', $1, $2, $3::jsonb, $4);",
+        "options": {}
+      },
+      "id": "36f7edfc-68eb-4fb9-98c1-9289499a40dc",
+      "name": "🚨 Error Handler Global",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        688,
+        608
+      ],
+      "notes": "Captura errores del flujo y los registra en la base de datos."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT current_database(), current_user;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -976,
+        432
+      ],
+      "id": "6ce1004b-6706-4c34-b090-39639346fa49",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "oC5JWDtfvxbOL5Zt",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Acceder a los datos de forma segura\nconst inputData = $input.all();\nconst items = [];\n\nfor (const item of inputData) {\n  // CAMBIO AQUÍ: buscamos 'file' en lugar de 'data'\n  const fileHash = item.binary?.file ? (item.binary.file.fileName + \"_\" + item.binary.file.fileSize) : \"no_hash\";\n  \n  const previousNode = $items(\"Crear Solicitud en DB\");\n  const requestCode = previousNode[0].json.request_code;\n  const requestId = previousNode[0].json.id;\n\n  items.push({\n    json: {\n      ...item.json,\n      request_id: requestId,\n      request_code: requestCode,\n      file_hash: fileHash\n    },\n    binary: item.binary // Esto es correcto, mantiene todo el objeto binary\n  });\n}\n\nreturn items;"
+      },
+      "id": "3a810539-d6ce-4f36-9a98-3d52b78c7474",
+      "name": "Calcular Hash Archivo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        128
+      ],
+      "notes": "Calcula SHA-256 del archivo para detección de duplicados."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(\n    (SELECT id FROM justification_requests \n     WHERE file_hash = '{{ $json.file_hash }}' AND id != '{{ $json.id }}' \n     LIMIT 1), \n    NULL\n) as id;",
+        "options": {
+          "replaceEmptyStrings": false
+        }
+      },
+      "id": "23a658a6-6ef3-462b-85f4-5f74e8f5b554",
+      "name": "Verificar Duplicado Redis/DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        128
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "oC5JWDtfvxbOL5Zt",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Verifica si el hash del archivo ya existe en solicitudes previas."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond_is_duplicate",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "=",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1fdb22b2-e1d0-4b74-978c-92e0b40ee74c",
+      "name": "¿Es Duplicado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        128
+      ],
+      "notes": "Bifurca el flujo si se detecta un documento duplicado."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond_has_file",
+              "leftValue": "={{ $('Validar y Sanitizar Input').item.json.file_key }}",
+              "rightValue": true,
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b5787b16-352e-4800-8eff-7bd689ff1939",
+      "name": "¿Tiene Archivo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        0,
+        224
+      ],
+      "notes": "Bifurca el flujo según si la solicitud incluye archivo adjunto."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Procesar respuesta OCR (Extracción de datos del input actual) ──\nlet ocrResponse;\ntry {\n  const rawData = ($json.body) ? $json.body : $json;\n  ocrResponse = (typeof rawData === 'string') ? JSON.parse(rawData) : rawData;\n} catch (e) {\n  throw new Error('Error al parsear el JSON de la API: ' + e.message);\n}\n\n// En lugar de buscar el nodo Webhook, tomamos los datos que ya vienen en el flujo actual\n// n8n automáticamente trae los datos anteriores si no los has limpiado.\n// Usamos el objeto $input que contiene todo lo que llegó al nodo.\nconst inputData = $input.all()[0].json;\n\nconst parsedResult = ocrResponse.ParsedResults[0];\nconst rawText = parsedResult.ParsedText || '';\nconst cleanText = rawText.replace(/[^\\x20-\\x7E\\xC0-\\xFF\\n]/g, ' ').trim();\n\n// Construimos el JSON final combinando todo\nreturn [{ \n  json: {\n    ...inputData, // Esto toma TODO lo que entró al nodo (id, nombre, etc.)\n    ocr_raw_text: rawText,\n    ocr_cleaned_text: cleanText,\n    ocr_exit_code: parsedResult.FileParseExitCode || 0\n  }\n}];"
+      },
+      "id": "d9988a40-f822-42c3-bea3-f4c9df3f8c4e",
+      "name": "Procesar Texto OCR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        128
+      ],
+      "notes": "Extrae y limpia el texto del resultado de OCR.Space."
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        480,
+        752
+      ],
+      "id": "6bb26f4f-5d68-49b8-b635-1e3c2295405e",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Recuperar el archivo que el nodo anterior borró\n// Lo buscamos en la entrada original del flujo (el Webhook)\nconst originalData = $('Webhook Recepción').first();\n\nreturn items.map(item => ({\n  json: item.json,\n  binary: originalData.binary // Inyectamos el archivo original aquí\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        352
+      ],
+      "id": "40fa1340-6ab8-4f53-b51e-f745cc62d97c",
+      "name": "Recuperar Archivo"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        496,
+        352
+      ],
+      "id": "857e5298-3aea-4ba8-a91c-17debc8b3473",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        704,
+        240
+      ],
+      "id": "8c9dc0e1-2af7-48d8-acd7-bea354b203fb",
+      "name": "When chat message received",
+      "webhookId": "355fc21e-b714-4fa0-9230-2cf620580f46"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Actúa como un asistente administrativo experto en gestión escolar. Tu tarea es analizar la justificación de inasistencia enviada por el estudiante.\n\n### DATOS DEL ESTUDIANTE:\n- Nombre: {{ $json.full_name }}\n- Fecha de ausencia: {{ $json.absence_date }}\n- Motivo reportado: {{ $json.absence_reason }}\n\n### DOCUMENTO ADJUNTO (OCR):\n\"\"\"\n{{ $json.ocr_cleaned_text }}\n\"\"\"\n\n### INSTRUCCIONES DE CLASIFICACIÓN:\n1. Compara el \"Motivo reportado\" con el texto extraído del documento.\n2. Clasifica la justificación en una de estas categorías:\n   - \"Válida\": Si el documento es oficial, legible y respalda el motivo.\n   - \"Inválida\": Si el documento no es claro, no coincide o es falso.\n   - \"Pendiente de Revisión\": Si el documento es ambiguo.\n3. Extrae la fecha del documento en formato YYYY-MM-DD.\n\n### FORMATO DE RESPUESTA:\nDevuelve EXCLUSIVAMENTE un objeto JSON, sin texto previo ni posterior:\n{\n  \"clasificacion\": \"string\",\n  \"confianza\": \"alta/media/baja\",\n  \"fecha_documento\": \"YYYY-MM-DD o null\",\n  \"comentario\": \"explicacion corta\"\n}",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        864,
+        128
+      ],
+      "id": "761525c6-3d0f-458e-b1ae-289f2f8928a2",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        912,
+        336
+      ],
+      "id": "529bca31-2e10-4265-a059-e844c9a12ae7",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "QDkka5bBvvcGInwI",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    " ¿Tiene Telegram?": {
+      "main": [
+        [
+          {
+            "node": "📱 Enviar Telegram — Estudiante",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "🔔 Notificar Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📱 Enviar Telegram — Estudiante": {
+      "main": [
+        [
+          {
+            "node": "📨 Responder al Formulario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Recepción": {
+      "main": [
+        [
+          {
+            "node": "Validar y Sanitizar Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar y Sanitizar Input": {
+      "main": [
+        [
+          {
+            "node": "Upsert Estudiante PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Estudiante PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "Crear Solicitud en DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crear Solicitud en DB": {
+      "main": [
+        [
+          {
+            "node": "Calcular Hash Archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Texto Sin Archivo": {
+      "main": [
+        [
+          {
+            "node": "Procesar Texto OCR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OCR.Space — Extraer Texto": {
+      "main": [
+        [
+          {
+            "node": "Procesar Texto OCR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI — Clasificar Documento": {
+      "main": [
+        []
+      ]
+    },
+    "Motor de Decisión": {
+      "main": [
+        [
+          {
+            "node": "Guardar Resultado en DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardar Resultado en DB": {
+      "main": [
+        [
+          {
+            "node": "📊 Google Sheets — Registrar",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Construir Mensaje Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construir Mensaje Telegram": {
+      "main": [
+        [
+          {
+            "node": " ¿Tiene Telegram?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        []
+      ]
+    },
+    "Calcular Hash Archivo": {
+      "main": [
+        [
+          {
+            "node": "Verificar Duplicado Redis/DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Duplicado Redis/DB": {
+      "main": [
+        [
+          {
+            "node": "Recuperar Archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Es Duplicado?": {
+      "main": [
+        [
+          {
+            "node": " Marcar como Duplicado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Tiene Archivo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Tiene Archivo?": {
+      "main": [
+        [
+          {
+            "node": "OCR.Space — Extraer Texto",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Texto Sin Archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Procesar Texto OCR": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recuperar Archivo": {
+      "main": [
+        [
+          {
+            "node": "¿Es Duplicado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Motor de Decisión",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "881a762d-a58c-4516-82ec-fa08efc9384e",
+  "meta": {
+    "instanceId": "4dc532a409f4cb1584b96198d727c40ca264e51724d10349b933575d66d180b3"
+  },
+  "id": "ip24H6GJk3GkP81h",
+  "tags": []
+}
